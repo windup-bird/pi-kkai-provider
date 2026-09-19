@@ -157,6 +157,10 @@ function writeSnapshot(payload: unknown): void {
 	}
 }
 
+// Read the snapshot eagerly, before the provider is registered: this is what
+// keeps startup off the network entirely, including when it is unreachable.
+catalog = readSnapshot();
+
 /**
  * The catalog is the only source of model names before login, so a disk snapshot
  * keeps cold and offline starts working instead of registering zero models.
@@ -291,8 +295,8 @@ function unpriced(id: string): PricingEntry {
 	return { model: id, ratio: 0, completion: 1, cacheRead: 1, cacheWrite: 0, groups: [] };
 }
 
-function catalogModels(): ProviderModelConfig[] {
-	return (catalog?.entries ?? []).map((entry) => buildModel(entry, catalog));
+function catalogModels(from: PricingCatalog | undefined): ProviderModelConfig[] {
+	return (from?.entries ?? []).map((entry) => buildModel(entry, from));
 }
 
 // =============================================================================
@@ -313,14 +317,20 @@ async function usableModelIds(key: string, signal: AbortSignal): Promise<string[
 }
 
 async function refreshModels(context: RefreshModelsContext): Promise<ProviderModelConfig[]> {
-	const pricing = await loadPricing(context.signal);
+	// pi calls this with `allowNetwork: false` while loading extensions and right
+	// after login, and it awaits the result -- so an offline phase must never touch
+	// the network. Use the in-memory/on-disk catalog instead.
+	if (!context.allowNetwork) return catalogModels(catalog ?? readSnapshot());
+
 	const key = context.credential?.type === "api_key" ? context.credential.key : undefined;
+	if (!key) return catalogModels(catalog ?? readSnapshot());
 
-	// Offline (or pre-login) the public catalog is still the best answer we have.
-	if (!context.allowNetwork || !key) return catalogModels();
-
-	const ids = await usableModelIds(key, context.signal);
-	if (ids.length === 0) return catalogModels();
+	// Independent, so run them together rather than paying both latencies in turn.
+	const [pricing, ids] = await Promise.all([
+		loadPricing(context.signal),
+		usableModelIds(key, context.signal),
+	]);
+	if (ids.length === 0) return catalogModels(pricing);
 
 	const byId = new Map((pricing?.entries ?? []).map((entry) => [entry.model, entry]));
 	return ids.map((id) => buildModel(byId.get(id) ?? unpriced(id), pricing));
@@ -341,7 +351,7 @@ export default async function (pi: ExtensionAPI) {
 		baseUrl: BASE_URL,
 		apiKey: API_KEY_CONFIG,
 		api: "openai-completions",
-		models: catalogModels(),
+		models: catalogModels(catalog),
 		refreshModels,
 	});
 }
