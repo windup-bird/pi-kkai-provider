@@ -5,10 +5,16 @@
  * first-class pi provider:
  *
  *   1. Login      -> `/login kkai` (or KKRICH_API_KEY / KKAI_API_KEY env var)
- *   2. Discovery  -> models are discovered from `/v1/models` and enriched with
- *                    live pricing from the public `/api/pricing` endpoint, so
- *                    pi's footer, `/session`, and auto-compaction know real
- *                    context windows and per-token cost.
+ *   2. Discovery  -> models are discovered from `/v1/models`, enriched with live
+ *                    pricing from the public `/api/pricing` endpoint, and with
+ *                    authoritative context/output limits from pi's own builtin
+ *                    catalog, so pi's footer, `/session`, and auto-compaction
+ *                    know real limits and per-token cost.
+ *
+ * Context note: the KKRICH gateway does not publish context windows anywhere
+ * (`/api/pricing`, `/v1/models` and the Gemini-compatible `/v1beta/models` all
+ * omit them), so limits are taken from pi's builtin catalog first and only fall
+ * back to a vendor-family heuristic when a model is unknown.
  *   3. Usage      -> `/kkai-usage` aggregates token/cost usage from the current
  *                    session or every session, plus server-side quota.
  *
@@ -23,6 +29,8 @@
  *   KKAI_GROUP_RATIO                override the group ratio from /api/pricing
  *   KKAI_QUOTA_PER_UNIT             new-api quota per USD, default 500000
  *   KKAI_PRICING_URL                override /api/pricing discovery URL
+ *   KKAI_NO_BUILTIN_METADATA        set to 1 to skip pi's builtin catalog and
+ *                                   always use the vendor-family heuristic
  */
 
 import {
@@ -34,6 +42,7 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { ModelCost, RefreshModelsContext, ThinkingLevelMap, Usage } from "@earendil-works/pi-ai";
+import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { Container, Text, matchesKey } from "@earendil-works/pi-tui";
 
 // =============================================================================
@@ -127,6 +136,7 @@ interface PricingEntry {
 	cacheRatio: number;
 	createCacheRatio: number;
 	endpoints: string[];
+	enableGroups: string[];
 }
 
 interface PricingCatalog {
@@ -166,6 +176,9 @@ function parsePricing(payload: unknown): PricingCatalog | undefined {
 		const endpoints = Array.isArray(item.supported_endpoint_types)
 			? item.supported_endpoint_types.filter((value): value is string => typeof value === "string")
 			: [];
+		const enableGroups = Array.isArray(item.enable_groups)
+			? item.enable_groups.filter((value): value is string => typeof value === "string")
+			: [];
 		entries.push({
 			modelName,
 			quotaType: asNumber(item.quota_type, 0),
@@ -174,6 +187,7 @@ function parsePricing(payload: unknown): PricingCatalog | undefined {
 			cacheRatio: asNumber(item.cache_ratio, 1),
 			createCacheRatio: asNumber(item.create_cache_ratio, 0),
 			endpoints,
+			enableGroups,
 		});
 	}
 
@@ -200,10 +214,20 @@ async function loadPricing(signal: AbortSignal | undefined, force: boolean, time
 	return pricingInFlight;
 }
 
-function resolveGroupRatio(catalog: PricingCatalog | undefined): number {
+/**
+ * Group ratio for one model. A model enabled in exactly one group can only be
+ * called with a key from that group, so its ratio is exact -- `/api/pricing`
+ * ratios differ per group (0.4 for `default` vs 1 for a dedicated group), and
+ * using the wrong one silently scales every cost.
+ */
+function groupRatioFor(catalog: PricingCatalog | undefined, entry: PricingEntry): number {
 	if (Number.isFinite(GROUP_RATIO_OVERRIDE)) return GROUP_RATIO_OVERRIDE as number;
-	const fromCatalog = catalog?.groupRatio[GROUP];
-	return Number.isFinite(fromCatalog) && (fromCatalog as number) > 0 ? (fromCatalog as number) : 1;
+	if (entry.enableGroups.length === 1) {
+		const single = catalog?.groupRatio[entry.enableGroups[0]];
+		if (Number.isFinite(single) && (single as number) > 0) return single as number;
+	}
+	const configured = catalog?.groupRatio[GROUP];
+	return Number.isFinite(configured) && (configured as number) > 0 ? (configured as number) : 1;
 }
 
 const NON_CHAT_ENDPOINTS = new Set(["image", "image-generation", "openai-video", "video", "audio", "embedding", "rerank"]);
@@ -254,10 +278,126 @@ const FIXED_THINKING_LEVELS: ThinkingLevelMap = {
 	max: null,
 };
 
+// -----------------------------------------------------------------------------
+// pi's builtin catalog: authoritative context/output limits
+// -----------------------------------------------------------------------------
+
 /**
- * Best-effort capability inference from the model id. The KKRICH gateway does
- * not publish context/output limits, so these are conservative defaults that
- * can be overridden per model in `~/.pi/agent/models.json` (`modelOverrides`).
+ * Vendors usually appear in several catalogs (e.g. `glm-5.3` exists under zai,
+ * opencode and github-copilot). First-party entries win, so their `compat` and
+ * `thinkingLevelMap` are the ones we adopt.
+ */
+const BUILTIN_PROVIDER_PRIORITY = [
+	"anthropic",
+	"openai",
+	"google",
+	"xai",
+	"deepseek",
+	"zai",
+	"moonshotai",
+	"moonshotai-cn",
+	"kimi-coding",
+	"qwen-token-plan",
+	"qwen-token-plan-cn",
+	"qwen-token-plan-individual",
+	"xiaomi",
+	"xiaomi-token-plan-cn",
+	"xiaomi-token-plan-ams",
+	"xiaomi-token-plan-sgp",
+	"minimax",
+	"minimax-cn",
+	"mistral",
+	"ant-ling",
+];
+
+const USE_BUILTIN_METADATA = process.env.KKAI_NO_BUILTIN_METADATA?.trim() !== "1";
+
+type BuiltinModel = ReturnType<typeof getBuiltinModels>[number];
+
+let builtinCatalog: Map<string, BuiltinModel> | undefined;
+
+/**
+ * Gateway aliases vs catalog ids: `glm-5.3-token` -> `glm-5.3`,
+ * `claude-haiku-4-5-20251001` -> `claude-haiku-4-5`, `gemini-3-pro-preview`
+ * -> `gemini-3-pro`. Returns every candidate id worth trying, best first.
+ */
+function normalizedIds(id: string): string[] {
+	const out: string[] = [];
+	const stripDate = (value: string) => value.replace(/-\d{4}-\d{2}-\d{2}$/, "").replace(/-\d{4,8}$/, "");
+	const stripVariant = (value: string) =>
+		value.replace(/-(preview|experimental|exp|reasoning|non-reasoning|nothinking|thinking)$/, "");
+
+	let base = id;
+	for (const suffix of ["-token-plan", "-token"]) {
+		if (base.endsWith(suffix)) {
+			base = base.slice(0, -suffix.length);
+			break;
+		}
+	}
+	for (const value of [base, stripDate(base), stripVariant(base), stripDate(stripVariant(base))]) {
+		if (value && value !== id) out.push(value);
+	}
+	return [...new Set(out)];
+}
+
+function builtinModelsById(): Map<string, BuiltinModel> {
+	if (builtinCatalog) return builtinCatalog;
+	const map = new Map<string, BuiltinModel>();
+	try {
+		const providers = getBuiltinProviders() as string[];
+		const ordered = [
+			...BUILTIN_PROVIDER_PRIORITY.filter((id) => providers.includes(id)),
+			...providers.filter((id) => !BUILTIN_PROVIDER_PRIORITY.includes(id)),
+		];
+		for (const provider of ordered) {
+			for (const model of getBuiltinModels(provider as Parameters<typeof getBuiltinModels>[0])) {
+				for (const key of [model.id, ...normalizedIds(model.id)]) {
+					if (!map.has(key)) map.set(key, model);
+				}
+			}
+		}
+	} catch {
+		// Best effort: an unavailable catalog just means we keep the heuristic.
+	}
+	builtinCatalog = map;
+	return map;
+}
+
+function lookupBuiltin(id: string): BuiltinModel | undefined {
+	if (!USE_BUILTIN_METADATA) return undefined;
+	const map = builtinModelsById();
+	for (const candidate of [id, ...normalizedIds(id)]) {
+		const hit = map.get(candidate);
+		if (hit) return hit;
+	}
+	return undefined;
+}
+
+/**
+ * Adopt curated metadata from pi's catalog. Wire-affecting fields (`compat`,
+ * `thinkingLevelMap`) are only copied when the upstream model speaks the same
+ * `openai-completions` protocol, since KKAI proxies everything through it.
+ */
+function fromBuiltin(model: BuiltinModel): Capability {
+	const contextWindow = model.contextWindow > 0 ? model.contextWindow : 128_000;
+	const maxTokens = Math.min(model.maxTokens > 0 ? model.maxTokens : 16_384, contextWindow);
+	const sameProtocol = model.api === "openai-completions";
+	return {
+		reasoning: Boolean(model.reasoning),
+		input: (model.input?.length ? model.input : ["text"]) as ("text" | "image")[],
+		contextWindow,
+		maxTokens,
+		...(sameProtocol && model.thinkingLevelMap
+			? { thinkingLevelMap: model.thinkingLevelMap as ThinkingLevelMap }
+			: {}),
+		...(sameProtocol && model.compat ? { compat: model.compat as Capability["compat"] } : {}),
+	};
+}
+
+/**
+ * Best-effort vendor-family fallback for models missing from pi's catalog. The
+ * KKRICH gateway publishes no limits, so these are conservative guesses; use
+ * `~/.pi/agent/models.json` (`modelOverrides`) to correct individual models.
  */
 function inferCapabilities(id: string): Capability {
 	const name = id.toLowerCase();
@@ -359,14 +499,19 @@ function computeCost(entry: PricingEntry, groupRatio: number): ModelCost {
 	};
 }
 
-function buildModel(entry: PricingEntry, groupRatio: number): ProviderModelConfig {
-	const capability = inferCapabilities(entry.modelName);
+function resolveCapabilities(id: string): Capability {
+	const builtin = lookupBuiltin(id);
+	return builtin ? fromBuiltin(builtin) : inferCapabilities(id);
+}
+
+function buildModel(entry: PricingEntry, catalog: PricingCatalog | undefined): ProviderModelConfig {
+	const capability = resolveCapabilities(entry.modelName);
 	return {
 		id: entry.modelName,
 		name: entry.modelName,
 		reasoning: capability.reasoning,
 		input: capability.input,
-		cost: computeCost(entry, groupRatio),
+		cost: computeCost(entry, groupRatioFor(catalog, entry)),
 		contextWindow: capability.contextWindow,
 		maxTokens: capability.maxTokens,
 		...(capability.thinkingLevelMap ? { thinkingLevelMap: capability.thinkingLevelMap } : {}),
@@ -383,13 +528,13 @@ function syntheticEntry(id: string): PricingEntry {
 		cacheRatio: 1,
 		createCacheRatio: 0,
 		endpoints: ["openai"],
+		enableGroups: [],
 	};
 }
 
 /** Static catalog built from public pricing data, so models exist before login. */
 function buildCatalogModels(): ProviderModelConfig[] {
-	const groupRatio = resolveGroupRatio(pricingCache);
-	return chatEntries(pricingCache).map((entry) => buildModel(entry, groupRatio));
+	return chatEntries(pricingCache).map((entry) => buildModel(entry, pricingCache));
 }
 
 // =============================================================================
@@ -427,9 +572,8 @@ async function discoverModels(context: RefreshModelsContext): Promise<ProviderMo
 		if (apiKey) {
 			const ids = await fetchModelIds(apiKey, context.signal).catch(() => []);
 			if (ids.length > 0) {
-				const groupRatio = resolveGroupRatio(pricingCache);
 				const byId = new Map((pricingCache?.entries ?? []).map((entry) => [entry.modelName, entry]));
-				return ids.map((id) => buildModel(byId.get(id) ?? syntheticEntry(id), groupRatio));
+				return ids.map((id) => buildModel(byId.get(id) ?? syntheticEntry(id), pricingCache));
 			}
 		}
 	}
