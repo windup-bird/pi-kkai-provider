@@ -1,0 +1,802 @@
+/**
+ * pi-kkai-provider
+ *
+ * Registers the KKAI (KKRICH, https://api.kkrich.ltd) OpenAI-compatible API as a
+ * first-class pi provider:
+ *
+ *   1. Login      -> `/login kkai` (or KKRICH_API_KEY / KKAI_API_KEY env var)
+ *   2. Discovery  -> models are discovered from `/v1/models` and enriched with
+ *                    live pricing from the public `/api/pricing` endpoint, so
+ *                    pi's footer, `/session`, and auto-compaction know real
+ *                    context windows and per-token cost.
+ *   3. Usage      -> `/kkai-usage` aggregates token/cost usage from the current
+ *                    session or every session, plus server-side quota.
+ *
+ * This extension uses pi's simple provider-config form
+ * (`pi.registerProvider(id, config)`), which is the smallest integration that
+ * still supports API-key login and dynamic `refreshModels`.
+ *
+ * Environment:
+ *   KKRICH_API_KEY | KKAI_API_KEY   API key (otherwise stored via /login)
+ *   KKAI_BASE_URL                   default https://api.kkrich.ltd/v1
+ *   KKAI_GROUP                      pricing group, default "default"
+ *   KKAI_GROUP_RATIO                override the group ratio from /api/pricing
+ *   KKAI_QUOTA_PER_UNIT             new-api quota per USD, default 500000
+ *   KKAI_PRICING_URL                override /api/pricing discovery URL
+ */
+
+import {
+	DynamicBorder,
+	SessionManager,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ProviderModelConfig,
+	type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
+import type { ModelCost, RefreshModelsContext, ThinkingLevelMap, Usage } from "@earendil-works/pi-ai";
+import { Container, Text, matchesKey } from "@earendil-works/pi-tui";
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+const PROVIDER_ID = "kkai";
+const PROVIDER_NAME = "KKAI";
+const DEFAULT_BASE_URL = "https://api.kkrich.ltd/v1";
+const DEFAULT_GROUP = "default";
+const DEFAULT_QUOTA_PER_UNIT = 500_000; // new-api default: 500,000 quota = $1
+const PRICING_TTL_MS = 10 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 15_000;
+// Startup blocks at most this long on the public pricing catalog; a failed warmup
+// still registers the provider and can be recovered with `/kkai-models`.
+const PRICING_WARMUP_TIMEOUT_MS = 3_000;
+
+function envPositiveNumber(name: string, fallback: number): number {
+	const raw = process.env[name]?.trim();
+	if (!raw) return fallback;
+	const value = Number(raw);
+	return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const BASE_URL = (process.env.KKAI_BASE_URL?.trim() || DEFAULT_BASE_URL).replace(/\/+$/, "");
+const GROUP = process.env.KKAI_GROUP?.trim() || DEFAULT_GROUP;
+const QUOTA_PER_UNIT = envPositiveNumber("KKAI_QUOTA_PER_UNIT", DEFAULT_QUOTA_PER_UNIT);
+const GROUP_RATIO_OVERRIDE = process.env.KKAI_GROUP_RATIO ? Number(process.env.KKAI_GROUP_RATIO) : undefined;
+// Resolve env keys lazily through pi's config-value syntax when present.
+const API_KEY_CONFIG = process.env.KKRICH_API_KEY
+	? "$KKRICH_API_KEY"
+	: process.env.KKAI_API_KEY
+		? "$KKAI_API_KEY"
+		: "$KKRICH_API_KEY";
+
+function envApiKey(): string | undefined {
+	return process.env.KKRICH_API_KEY?.trim() || process.env.KKAI_API_KEY?.trim() || undefined;
+}
+
+function pricingUrl(): string {
+	const override = process.env.KKAI_PRICING_URL?.trim();
+	if (override) return override;
+	try {
+		const url = new URL(BASE_URL);
+		const root = url.pathname === "/v1" || url.pathname === "/v1/" ? url.origin : BASE_URL.replace(/\/v1$/, "");
+		return `${root}/api/pricing`;
+	} catch {
+		return `${BASE_URL.replace(/\/v1$/, "")}/api/pricing`;
+	}
+}
+
+/** Abort a fetch when the caller aborts or the timeout elapses. */
+function linkedSignal(signal: AbortSignal | undefined, timeoutMs: number): { signal: AbortSignal; dispose: () => void } {
+	const controller = new AbortController();
+	const onAbort = () => controller.abort(signal?.reason);
+	if (signal) {
+		if (signal.aborted) controller.abort(signal.reason);
+		else signal.addEventListener("abort", onAbort, { once: true });
+	}
+	const timer = setTimeout(() => controller.abort(new Error("request timed out")), timeoutMs);
+	(timer as { unref?: () => void }).unref?.();
+	return {
+		signal: controller.signal,
+		dispose: () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		},
+	};
+}
+
+async function fetchJson(url: string, init: RequestInit, signal: AbortSignal | undefined, timeoutMs = FETCH_TIMEOUT_MS): Promise<unknown> {
+	const linked = linkedSignal(signal, timeoutMs);
+	try {
+		const response = await fetch(url, { ...init, signal: linked.signal });
+		if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`);
+		return (await response.json()) as unknown;
+	} finally {
+		linked.dispose();
+	}
+}
+
+// =============================================================================
+// Pricing (/api/pricing, public)
+// =============================================================================
+
+interface PricingEntry {
+	modelName: string;
+	quotaType: number;
+	modelRatio: number;
+	completionRatio: number;
+	cacheRatio: number;
+	createCacheRatio: number;
+	endpoints: string[];
+}
+
+interface PricingCatalog {
+	fetchedAt: number;
+	groupRatio: Record<string, number>;
+	entries: PricingEntry[];
+}
+
+let pricingCache: PricingCatalog | undefined;
+let pricingInFlight: Promise<PricingCatalog | undefined> | undefined;
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+	const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+	return Number.isFinite(n) ? n : fallback;
+}
+
+function parsePricing(payload: unknown): PricingCatalog | undefined {
+	const root = asRecord(payload);
+	const rows = Array.isArray(root?.data) ? root.data : undefined;
+	if (!rows) return undefined;
+
+	const groupRatio: Record<string, number> = {};
+	const rawGroupRatio = asRecord(root?.group_ratio);
+	if (rawGroupRatio) {
+		for (const [key, value] of Object.entries(rawGroupRatio)) groupRatio[key] = asNumber(value, 1);
+	}
+
+	const entries: PricingEntry[] = [];
+	for (const row of rows) {
+		const item = asRecord(row);
+		const modelName = typeof item?.model_name === "string" ? item.model_name : undefined;
+		if (!item || !modelName) continue;
+		const endpoints = Array.isArray(item.supported_endpoint_types)
+			? item.supported_endpoint_types.filter((value): value is string => typeof value === "string")
+			: [];
+		entries.push({
+			modelName,
+			quotaType: asNumber(item.quota_type, 0),
+			modelRatio: asNumber(item.model_ratio, 0),
+			completionRatio: asNumber(item.completion_ratio, 1),
+			cacheRatio: asNumber(item.cache_ratio, 1),
+			createCacheRatio: asNumber(item.create_cache_ratio, 0),
+			endpoints,
+		});
+	}
+
+	return { fetchedAt: Date.now(), groupRatio, entries };
+}
+
+async function loadPricing(signal: AbortSignal | undefined, force: boolean, timeoutMs = FETCH_TIMEOUT_MS): Promise<PricingCatalog | undefined> {
+	if (!force && pricingCache && Date.now() - pricingCache.fetchedAt < PRICING_TTL_MS) return pricingCache;
+	if (pricingInFlight) return pricingInFlight;
+
+	pricingInFlight = (async () => {
+		try {
+			const payload = await fetchJson(pricingUrl(), { headers: { Accept: "application/json" } }, signal, timeoutMs);
+			const parsed = parsePricing(payload);
+			if (parsed) pricingCache = parsed;
+			return parsed ?? pricingCache;
+		} catch {
+			return pricingCache;
+		} finally {
+			pricingInFlight = undefined;
+		}
+	})();
+
+	return pricingInFlight;
+}
+
+function resolveGroupRatio(catalog: PricingCatalog | undefined): number {
+	if (Number.isFinite(GROUP_RATIO_OVERRIDE)) return GROUP_RATIO_OVERRIDE as number;
+	const fromCatalog = catalog?.groupRatio[GROUP];
+	return Number.isFinite(fromCatalog) && (fromCatalog as number) > 0 ? (fromCatalog as number) : 1;
+}
+
+const NON_CHAT_ENDPOINTS = new Set(["image", "image-generation", "openai-video", "video", "audio", "embedding", "rerank"]);
+const NON_CHAT_ID = /(^|[-_./])(image|video|seedance|embedding|rerank|tts|whisper|moderation)([-_./]|$)/i;
+
+/** Keep only models that can serve chat completions. */
+function isChatEntry(entry: PricingEntry): boolean {
+	if (/^sd[_.-]/i.test(entry.modelName)) return false;
+	if (NON_CHAT_ID.test(entry.modelName)) return false;
+	if (entry.endpoints.some((endpoint) => NON_CHAT_ENDPOINTS.has(endpoint))) return false;
+	if (entry.endpoints.length === 0) return true;
+	return entry.endpoints.includes("openai") || entry.endpoints.includes("anthropic");
+}
+
+function chatEntries(catalog: PricingCatalog | undefined): PricingEntry[] {
+	return (catalog?.entries ?? []).filter(isChatEntry);
+}
+
+// =============================================================================
+// Model capabilities and cost
+// =============================================================================
+
+interface Capability {
+	reasoning: boolean;
+	input: ("text" | "image")[];
+	contextWindow: number;
+	maxTokens: number;
+	thinkingLevelMap?: ThinkingLevelMap;
+	compat?: NonNullable<ProviderModelConfig["compat"]>;
+}
+
+// pi levels -> provider reasoning_effort values (OpenAI-compatible families).
+const OPENAI_THINKING_LEVELS: ThinkingLevelMap = {
+	minimal: "minimal",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: null,
+	max: null,
+};
+// Model emits thinking, but the gateway does not expose a controllable level.
+const FIXED_THINKING_LEVELS: ThinkingLevelMap = {
+	minimal: null,
+	low: null,
+	medium: null,
+	high: null,
+	xhigh: null,
+	max: null,
+};
+
+/**
+ * Best-effort capability inference from the model id. The KKRICH gateway does
+ * not publish context/output limits, so these are conservative defaults that
+ * can be overridden per model in `~/.pi/agent/models.json` (`modelOverrides`).
+ */
+function inferCapabilities(id: string): Capability {
+	const name = id.toLowerCase();
+
+	if (name.includes("gemini")) {
+		return {
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_048_576,
+			maxTokens: 65_536,
+			thinkingLevelMap: FIXED_THINKING_LEVELS,
+		};
+	}
+	if (name.includes("claude")) {
+		return {
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 200_000,
+			maxTokens: 64_000,
+			thinkingLevelMap: FIXED_THINKING_LEVELS,
+		};
+	}
+	if (/^(gpt-|o[1-9](-|$))/.test(name) || name.includes("codex")) {
+		return {
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 400_000,
+			maxTokens: 128_000,
+			thinkingLevelMap: OPENAI_THINKING_LEVELS,
+			compat: { supportsReasoningEffort: true, maxTokensField: "max_completion_tokens" },
+		};
+	}
+	if (name.includes("grok")) {
+		const reasoning = !name.includes("non-reasoning");
+		return {
+			reasoning,
+			input: ["text", "image"],
+			contextWindow: 256_000,
+			maxTokens: 32_000,
+			...(reasoning ? { thinkingLevelMap: OPENAI_THINKING_LEVELS, compat: { supportsReasoningEffort: true } } : {}),
+		};
+	}
+	if (name.includes("deepseek")) {
+		return {
+			reasoning: true,
+			input: /vision|vl/.test(name) ? ["text", "image"] : ["text"],
+			contextWindow: 131_072,
+			maxTokens: 32_000,
+			thinkingLevelMap: FIXED_THINKING_LEVELS,
+		};
+	}
+	if (name.includes("qwen")) {
+		return {
+			reasoning: true,
+			input: /vl/.test(name) ? ["text", "image"] : ["text"],
+			contextWindow: 262_144,
+			maxTokens: 32_768,
+			thinkingLevelMap: FIXED_THINKING_LEVELS,
+		};
+	}
+	if (name.includes("glm")) {
+		return {
+			reasoning: true,
+			input: /vision|v\d/.test(name) ? ["text", "image"] : ["text"],
+			contextWindow: 200_000,
+			maxTokens: 32_768,
+			thinkingLevelMap: FIXED_THINKING_LEVELS,
+		};
+	}
+	if (name.includes("kimi")) {
+		return {
+			reasoning: true,
+			input: ["text"],
+			contextWindow: 262_144,
+			maxTokens: 32_768,
+			thinkingLevelMap: FIXED_THINKING_LEVELS,
+		};
+	}
+	return { reasoning: false, input: ["text"], contextWindow: 128_000, maxTokens: 16_384 };
+}
+
+/**
+ * new-api pricing model: quota = tokens * model_ratio * group_ratio, where
+ * QUOTA_PER_UNIT quota equals one USD. Price per 1M tokens is therefore
+ * `ratio * groupRatio * 1_000_000 / quotaPerUnit`.
+ */
+function computeCost(entry: PricingEntry, groupRatio: number): ModelCost {
+	if (entry.quotaType !== 0) {
+		return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+	}
+	const perUnit = 1_000_000 / QUOTA_PER_UNIT;
+	const base = entry.modelRatio * groupRatio;
+	const rate = (ratio: number) => Number((ratio * perUnit).toFixed(6));
+	return {
+		input: rate(base),
+		output: rate(base * (entry.completionRatio || 1)),
+		cacheRead: rate(base * (entry.cacheRatio ?? 1)),
+		cacheWrite: rate(base * (entry.createCacheRatio ?? 0)),
+	};
+}
+
+function buildModel(entry: PricingEntry, groupRatio: number): ProviderModelConfig {
+	const capability = inferCapabilities(entry.modelName);
+	return {
+		id: entry.modelName,
+		name: entry.modelName,
+		reasoning: capability.reasoning,
+		input: capability.input,
+		cost: computeCost(entry, groupRatio),
+		contextWindow: capability.contextWindow,
+		maxTokens: capability.maxTokens,
+		...(capability.thinkingLevelMap ? { thinkingLevelMap: capability.thinkingLevelMap } : {}),
+		...(capability.compat ? { compat: capability.compat } : {}),
+	};
+}
+
+function syntheticEntry(id: string): PricingEntry {
+	return {
+		modelName: id,
+		quotaType: 0,
+		modelRatio: 0,
+		completionRatio: 1,
+		cacheRatio: 1,
+		createCacheRatio: 0,
+		endpoints: ["openai"],
+	};
+}
+
+/** Static catalog built from public pricing data, so models exist before login. */
+function buildCatalogModels(): ProviderModelConfig[] {
+	const groupRatio = resolveGroupRatio(pricingCache);
+	return chatEntries(pricingCache).map((entry) => buildModel(entry, groupRatio));
+}
+
+// =============================================================================
+// Model discovery (/v1/models, authenticated)
+// =============================================================================
+
+function parseModelIds(payload: unknown): string[] {
+	const root = asRecord(payload);
+	const rows = Array.isArray(root?.data) ? root.data : Array.isArray(root?.models) ? root.models : undefined;
+	if (!rows) return [];
+	const ids = new Set<string>();
+	for (const row of rows) {
+		if (typeof row === "string") {
+			ids.add(row);
+			continue;
+		}
+		const item = asRecord(row);
+		const id = typeof item?.id === "string" ? item.id : typeof item?.name === "string" ? item.name : undefined;
+		if (id) ids.add(id);
+	}
+	return [...ids];
+}
+
+async function fetchModelIds(apiKey: string, signal: AbortSignal | undefined): Promise<string[]> {
+	const payload = await fetchJson(`${BASE_URL}/models`, { headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" } }, signal);
+	return parseModelIds(payload);
+}
+
+async function discoverModels(context: RefreshModelsContext): Promise<ProviderModelConfig[]> {
+	const credentialKey = context.credential?.type === "api_key" ? context.credential.key : undefined;
+	const apiKey = credentialKey?.trim() || envApiKey();
+
+	if (context.allowNetwork) {
+		await loadPricing(context.signal, true);
+		if (apiKey) {
+			const ids = await fetchModelIds(apiKey, context.signal).catch(() => []);
+			if (ids.length > 0) {
+				const groupRatio = resolveGroupRatio(pricingCache);
+				const byId = new Map((pricingCache?.entries ?? []).map((entry) => [entry.modelName, entry]));
+				return ids.map((id) => buildModel(byId.get(id) ?? syntheticEntry(id), groupRatio));
+			}
+		}
+	}
+
+	return buildCatalogModels();
+}
+
+// =============================================================================
+// Usage aggregation
+// =============================================================================
+
+interface Totals {
+	requests: number;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	reasoning: number;
+	totalTokens: number;
+	cost: number;
+}
+
+function emptyTotals(): Totals {
+	return { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 0, cost: 0 };
+}
+
+function addUsage(totals: Totals, usage: Usage | undefined): void {
+	if (!usage) return;
+	totals.requests += 1;
+	totals.input += usage.input ?? 0;
+	totals.output += usage.output ?? 0;
+	totals.cacheRead += usage.cacheRead ?? 0;
+	totals.cacheWrite += usage.cacheWrite ?? 0;
+	totals.reasoning += usage.reasoning ?? 0;
+	totals.totalTokens +=
+		usage.totalTokens ?? (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+	totals.cost += usage.cost?.total ?? 0;
+}
+
+interface UsageReport {
+	sessions: number;
+	models: Map<string, Totals>;
+	days: Map<string, Totals>;
+	total: Totals;
+}
+
+function newReport(): UsageReport {
+	return { sessions: 0, models: new Map(), days: new Map(), total: emptyTotals() };
+}
+
+function bucket(map: Map<string, Totals>, key: string): Totals {
+	const existing = map.get(key);
+	if (existing) return existing;
+	const created = emptyTotals();
+	map.set(key, created);
+	return created;
+}
+
+function collectEntries(entries: readonly SessionEntry[], report: UsageReport, byDay: boolean): void {
+	for (const entry of entries) {
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (!message || message.role !== "assistant") continue;
+		if (message.provider !== PROVIDER_ID) continue;
+		const usage = message.usage;
+		if (!usage) continue;
+
+		const model = message.model || message.responseModel || "unknown";
+		addUsage(bucket(report.models, model), usage);
+		addUsage(report.total, usage);
+
+		if (byDay) {
+			const timestamp = typeof message.timestamp === "number" ? message.timestamp : Date.parse(entry.timestamp);
+			if (Number.isFinite(timestamp)) {
+				addUsage(bucket(report.days, new Date(timestamp).toISOString().slice(0, 10)), usage);
+			}
+		}
+	}
+}
+
+async function collectAllSessions(report: UsageReport, onProgress?: (loaded: number, total: number) => void): Promise<void> {
+	const sessions = await SessionManager.listAll((loaded, total) => onProgress?.(loaded, total));
+	report.sessions = 0;
+	for (const info of sessions) {
+		try {
+			const manager = SessionManager.open(info.path);
+			collectEntries(manager.getBranch(), report, true);
+			report.sessions += 1;
+		} catch {
+			// Ignore unreadable/corrupt session files.
+		}
+	}
+}
+
+// =============================================================================
+// Server-side quota (new-api billing endpoints)
+// =============================================================================
+
+interface ServerUsage {
+	usedUsd?: number;
+	remainingUsd?: number;
+	systemLimitUsd?: number;
+	period: string;
+	error?: string;
+}
+
+function asUsd(value: unknown): number | undefined {
+	const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+	return Number.isFinite(n) ? n : undefined;
+}
+
+async function fetchServerUsage(apiKey: string, signal: AbortSignal | undefined, days: number): Promise<ServerUsage> {
+	const end = new Date();
+	const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
+	const period = `${start.toISOString().slice(0, 10)} → ${end.toISOString().slice(0, 10)}`;
+	const params = `start_date=${start.toISOString().slice(0, 10)}&end_date=${end.toISOString().slice(0, 10)}`;
+	const headers = { Authorization: `Bearer ${apiKey}`, Accept: "application/json" };
+
+	const [subscription, usage] = await Promise.all([
+		fetchJson(`${BASE_URL}/dashboard/billing/subscription`, { headers }, signal).catch(() => undefined),
+		fetchJson(`${BASE_URL}/dashboard/billing/usage?${params}`, { headers }, signal).catch(() => undefined),
+	]);
+
+	const subscriptionRecord = asRecord(subscription);
+	const usageRecord = asRecord(usage);
+	if (!subscriptionRecord && !usageRecord) {
+		return { period, error: "billing endpoints unavailable" };
+	}
+
+	const usedUsd = asUsd(usageRecord?.total_usage_usd) ?? (() => {
+		const cents = asUsd(usageRecord?.total_usage);
+		return cents === undefined ? undefined : cents / 100;
+	})();
+
+	return {
+		usedUsd,
+		remainingUsd: asUsd(subscriptionRecord?.hard_limit_usd) ?? asUsd(subscriptionRecord?.hard_limit),
+		systemLimitUsd: asUsd(subscriptionRecord?.system_hard_limit_usd) ?? asUsd(subscriptionRecord?.system_hard_limit),
+		period,
+	};
+}
+
+// =============================================================================
+// Report formatting
+// =============================================================================
+
+const MODEL_COLUMN = 30;
+
+function pad(value: string, width: number): string {
+	return value.length >= width ? `${value.slice(0, width - 1)}…` : value.padEnd(width, " ");
+}
+
+function padStart(value: string, width: number): string {
+	return value.padStart(width, " ");
+}
+
+function formatInt(value: number): string {
+	return Math.round(value).toLocaleString("en-US");
+}
+
+function formatUsd(value: number): string {
+	return `$${value.toFixed(4)}`;
+}
+
+function totalsRow(label: string, totals: Totals): string {
+	return (
+		pad(label, MODEL_COLUMN) +
+		padStart(String(totals.requests), 5) +
+		padStart(formatInt(totals.input), 12) +
+		padStart(formatInt(totals.cacheRead), 12) +
+		padStart(formatInt(totals.cacheWrite), 12) +
+		padStart(formatInt(totals.output), 12) +
+		padStart(formatUsd(totals.cost), 12)
+	);
+}
+
+function tableHeader(): string {
+	return (
+		pad("Model", MODEL_COLUMN) +
+		padStart("Req", 5) +
+		padStart("Input", 12) +
+		padStart("Cache-R", 12) +
+		padStart("Cache-W", 12) +
+		padStart("Output", 12) +
+		padStart("Cost", 12)
+	);
+}
+
+function sortByCost(entries: Iterable<[string, Totals]>): [string, Totals][] {
+	return [...entries].sort((a, b) => b[1].cost - a[1].cost || b[1].totalTokens - a[1].totalTokens);
+}
+
+function buildUsageText(report: UsageReport, scope: string, server: ServerUsage | undefined): string {
+	const lines: string[] = [];
+	lines.push(`Scope: ${scope}`);
+	lines.push("");
+
+	if (report.total.requests === 0) {
+		lines.push("No KKAI usage recorded.");
+	} else {
+		lines.push(tableHeader());
+		for (const [model, totals] of sortByCost(report.models).slice(0, 20)) {
+			lines.push(totalsRow(model, totals));
+		}
+		lines.push(pad("", MODEL_COLUMN) + padStart("", 5) + padStart("", 12) + padStart("", 12) + padStart("", 12) + padStart("", 12) + padStart("", 12));
+		lines.push(totalsRow("TOTAL", report.total));
+
+		const promptTokens = report.total.input + report.total.cacheRead + report.total.cacheWrite;
+		const hitRate = promptTokens > 0 ? (report.total.cacheRead / promptTokens) * 100 : 0;
+		lines.push("");
+		lines.push(
+			`Cache hit rate: ${hitRate.toFixed(1)}% of prompt tokens` +
+				(report.total.reasoning > 0 ? `   Reasoning: ${formatInt(report.total.reasoning)}` : ""),
+		);
+
+		if (report.days.size > 1) {
+			lines.push("");
+			lines.push("By day");
+			lines.push(tableHeader());
+			for (const [day, totals] of [...report.days.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1)).slice(0, 14)) {
+				lines.push(totalsRow(day, totals));
+			}
+		}
+	}
+
+	if (server) {
+		lines.push("");
+		lines.push(`Server quota (${server.period})`);
+		if (server.error) {
+			lines.push(`  Unavailable: ${server.error}`);
+		} else {
+			if (server.usedUsd !== undefined) lines.push(`  Used:        ${formatUsd(server.usedUsd)}`);
+			if (server.remainingUsd !== undefined) lines.push(`  Hard limit:  ${formatUsd(server.remainingUsd)}`);
+			if (server.systemLimitUsd !== undefined) lines.push(`  System cap:  ${formatUsd(server.systemLimitUsd)}`);
+		}
+	}
+
+	return lines.join("\n");
+}
+
+async function showReport(title: string, body: string, ctx: ExtensionCommandContext): Promise<void> {
+	if (ctx.mode === "tui") {
+		await ctx.ui.custom((_tui, theme, _keybindings, done) => {
+			const container = new Container();
+			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+			container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+			container.addChild(new Text(body, 1, 1));
+			container.addChild(new Text(theme.fg("dim", "Press Enter or Esc to close"), 1, 0));
+			container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+			return {
+				render: (width: number) => container.render(width),
+				invalidate: () => container.invalidate(),
+				handleInput: (data: string) => {
+					if (matchesKey(data, "enter") || matchesKey(data, "escape")) done(undefined);
+				},
+			};
+		});
+		return;
+	}
+
+	if (ctx.hasUI) {
+		ctx.ui.notify(`${title}: ${body.replace(/\s+/g, " ").slice(0, 240)}`, "info");
+		return;
+	}
+	process.stdout.write(`${title}\n${body}\n`);
+}
+
+// =============================================================================
+// Extension
+// =============================================================================
+
+export default async function (pi: ExtensionAPI) {
+	// Warm the public pricing catalog so models/cost are available for `--list-models`,
+	// `--model kkai/...`, and the post-login model snapshot. Bounded so offline startup
+	// only waits briefly.
+	await loadPricing(undefined, false, PRICING_WARMUP_TIMEOUT_MS);
+
+	pi.registerProvider(PROVIDER_ID, {
+		name: PROVIDER_NAME,
+		baseUrl: BASE_URL,
+		apiKey: API_KEY_CONFIG,
+		api: "openai-completions",
+		models: buildCatalogModels(),
+		async refreshModels(context) {
+			return discoverModels(context);
+		},
+	});
+
+	// Refresh the discovered catalog after login/startup so /model matches the key.
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+			const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+			if (!apiKey) return;
+		} catch {
+			return;
+		}
+		void ctx.modelRegistry.refresh({ providers: [PROVIDER_ID], force: true }).catch(() => undefined);
+	});
+
+	pi.registerCommand("kkai-usage", {
+		description: "Show KKAI token usage and cost (current session; add --all for every session)",
+		getArgumentCompletions: (prefix) =>
+			[
+				{ value: "--all", label: "--all", description: "Aggregate every saved session" },
+				{ value: "--session", label: "--session", description: "Current session only (default)" },
+			].filter((item) => item.value.startsWith(prefix)),
+		handler: async (args, ctx) => {
+			const all = /(^|\s)(--all|-a|all)(\s|$)/.test(args);
+			const report = newReport();
+			const statusKey = `${PROVIDER_ID}-usage`;
+
+			if (all) {
+				if (ctx.hasUI) ctx.ui.setStatus(statusKey, "Scanning sessions…");
+				await collectAllSessions(report, (loaded, total) => {
+					if (ctx.hasUI && (loaded === total || loaded % 25 === 0)) {
+						ctx.ui.setStatus(statusKey, `Scanning sessions ${loaded}/${total}…`);
+					}
+				});
+				if (ctx.hasUI) ctx.ui.setStatus(statusKey, undefined);
+			} else {
+				collectEntries(ctx.sessionManager.getBranch(), report, true);
+				report.sessions = 1;
+			}
+
+			let server: ServerUsage | undefined;
+			try {
+				const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+				if (apiKey) server = await fetchServerUsage(apiKey, undefined, 30);
+			} catch {
+				// Quota lookup is best-effort.
+			}
+
+			const scope = all
+				? `all sessions (${report.sessions} scanned)`
+				: "current session";
+			const body = buildUsageText(report, scope, server);
+			await showReport(`KKAI usage · ${scope}`, body, ctx);
+			if (ctx.hasUI) ctx.ui.setStatus(statusKey, undefined);
+		},
+	});
+
+	pi.registerCommand("kkai-models", {
+		description: "Refresh and list the KKAI models available to the configured key",
+		handler: async (_args, ctx) => {
+			if (ctx.hasUI) ctx.ui.setStatus(`${PROVIDER_ID}-models`, "Refreshing models…");
+			await ctx.modelRegistry.refresh({ providers: [PROVIDER_ID], force: true }).catch(() => undefined);
+			if (ctx.hasUI) ctx.ui.setStatus(`${PROVIDER_ID}-models`, undefined);
+
+			const models = ctx.modelRegistry
+				.getAll()
+				.filter((model) => model.provider === PROVIDER_ID)
+				.sort((a, b) => a.id.localeCompare(b.id));
+
+			const lines = [`Discovered ${models.length} KKAI model(s) for group "${GROUP}".`, ""];
+			if (models.length > 0) {
+				lines.push(pad("Model", 34) + padStart("Ctx", 10) + padStart("Max out", 10) + padStart("$/M in", 10) + padStart("$/M out", 10));
+				for (const model of models) {
+					lines.push(
+						pad(model.id, 34) +
+							padStart(formatInt(model.contextWindow), 10) +
+							padStart(formatInt(model.maxTokens), 10) +
+							padStart(model.cost.input.toFixed(4), 10) +
+							padStart(model.cost.output.toFixed(4), 10),
+					);
+				}
+			}
+			await showReport("KKAI models", lines.join("\n"), ctx);
+		},
+	});
+}
