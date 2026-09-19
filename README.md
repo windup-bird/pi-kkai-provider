@@ -100,6 +100,14 @@ quota = tokens × model_ratio × group_ratio        （1 USD = KKAI_QUOTA_PER_UN
 
 部分模型（如 deepseek 系列）使用 `billing_expr`，含**分时倍率**（工作日 9–12、14–18（Asia/Shanghai）翻倍）。当前实现按基础倍率估算，未计入分时上浮。
 
+## 模型清单与上下文长度
+
+模型名与价格来自公开的 `GET /api/pricing`，上下文/输出上限来自 **pi 自带的模型目录**（按 `-token` / `-日期` / `-preview` 等别名归一化后匹配，优先取厂商一方目录）。
+
+网关本身**不提供**上下文长度（`/api/pricing`、`/v1/models`、`/v1beta/models` 的 `inputTokenLimit` 均为空），因此无法从 KKAI 直接获取；目录未命中的模型才回落到按厂商族猜测，可用 `~/.pi/agent/models.json` 的 `modelOverrides` 单独修正。
+
+发现的模型目录会**快照到磁盘**（`~/.pi/agent/kkai-pricing.json`，可用 `KKAI_PRICING_CACHE` 改路径），因此冷启动/离线也能拿到完整模型列表，启动时间不依赖网络；联网时后台静默刷新价格。`KKAI_NO_BUILTIN_METADATA=1` 可关闭目录匹配。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -110,6 +118,8 @@ quota = tokens × model_ratio × group_ratio        （1 USD = KKAI_QUOTA_PER_UN
 | `KKAI_GROUP_RATIO` | — | 直接覆盖分组倍率 |
 | `KKAI_QUOTA_PER_UNIT` | `500000` | 1 USD 对应的 quota（new-api 默认 50 万） |
 | `KKAI_PRICING_URL` | `<origin>/api/pricing` | 价格接口地址 |
+| `KKAI_PRICING_CACHE` | `~/.pi/agent/kkai-pricing.json` | 模型目录快照路径 |
+| `KKAI_NO_BUILTIN_METADATA` | — | 设为 `1` 禁用 pi 目录，改用启发式 |
 
 ## 开发
 

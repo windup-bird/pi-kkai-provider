@@ -29,6 +29,8 @@
  *   KKAI_GROUP_RATIO                override the group ratio from /api/pricing
  *   KKAI_QUOTA_PER_UNIT             new-api quota per USD, default 500000
  *   KKAI_PRICING_URL                override /api/pricing discovery URL
+ *   KKAI_PRICING_CACHE              on-disk catalog snapshot path (default
+ *                                   ~/.pi/agent/kkai-pricing.json)
  *   KKAI_NO_BUILTIN_METADATA        set to 1 to skip pi's builtin catalog and
  *                                   always use the vendor-family heuristic
  */
@@ -41,6 +43,9 @@ import {
 	type ProviderModelConfig,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ModelCost, RefreshModelsContext, ThinkingLevelMap, Usage } from "@earendil-works/pi-ai";
 import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { Container, Text, matchesKey } from "@earendil-works/pi-tui";
@@ -56,9 +61,9 @@ const DEFAULT_GROUP = "default";
 const DEFAULT_QUOTA_PER_UNIT = 500_000; // new-api default: 500,000 quota = $1
 const PRICING_TTL_MS = 10 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 15_000;
-// Startup blocks at most this long on the public pricing catalog; a failed warmup
-// still registers the provider and can be recovered with `/kkai-models`.
-const PRICING_WARMUP_TIMEOUT_MS = 3_000;
+// First run only (no snapshot yet) waits briefly on the public pricing catalog;
+// later runs load the snapshot instantly and refresh in the background.
+const PRICING_WARMUP_TIMEOUT_MS = 6_000;
 
 function envPositiveNumber(name: string, fallback: number): number {
 	const raw = process.env[name]?.trim();
@@ -194,24 +199,68 @@ function parsePricing(payload: unknown): PricingCatalog | undefined {
 	return { fetchedAt: Date.now(), groupRatio, entries };
 }
 
+/**
+ * Last good `/api/pricing` payload, cached on disk. Without it a cold start on a
+ * flaky network yields an empty catalog (and therefore zero models), because the
+ * endpoint is the only source of model names before login.
+ */
+const PRICING_SNAPSHOT_FILE =
+	process.env.KKAI_PRICING_CACHE?.trim() || join(homedir(), ".pi", "agent", "kkai-pricing.json");
+
+function loadPricingSnapshot(): PricingCatalog | undefined {
+	try {
+		const wrapper = asRecord(JSON.parse(readFileSync(PRICING_SNAPSHOT_FILE, "utf8")) as unknown);
+		const parsed = parsePricing(wrapper?.payload);
+		if (!parsed || parsed.entries.length === 0) return undefined;
+		return { ...parsed, fetchedAt: asNumber(wrapper?.savedAt, 0) };
+	} catch {
+		return undefined;
+	}
+}
+
+function savePricingSnapshot(payload: unknown): void {
+	try {
+		mkdirSync(dirname(PRICING_SNAPSHOT_FILE), { recursive: true });
+		writeFileSync(PRICING_SNAPSHOT_FILE, JSON.stringify({ savedAt: Date.now(), payload }));
+	} catch {
+		// Snapshot is best-effort; never let a read-only home break discovery.
+	}
+}
+
+// Seed synchronously at module load, before the provider is registered, so the
+// first registration already carries the full catalog.
+pricingCache = loadPricingSnapshot();
+
 async function loadPricing(signal: AbortSignal | undefined, force: boolean, timeoutMs = FETCH_TIMEOUT_MS): Promise<PricingCatalog | undefined> {
 	if (!force && pricingCache && Date.now() - pricingCache.fetchedAt < PRICING_TTL_MS) return pricingCache;
 	if (pricingInFlight) return pricingInFlight;
 
-	pricingInFlight = (async () => {
+	const attempt = (async () => {
 		try {
 			const payload = await fetchJson(pricingUrl(), { headers: { Accept: "application/json" } }, signal, timeoutMs);
 			const parsed = parsePricing(payload);
-			if (parsed) pricingCache = parsed;
-			return parsed ?? pricingCache;
+			if (parsed && parsed.entries.length > 0) {
+				pricingCache = parsed;
+				savePricingSnapshot(payload);
+				return parsed;
+			}
 		} catch {
-			return pricingCache;
-		} finally {
-			pricingInFlight = undefined;
+			// fall through to the snapshot
 		}
+		const fallback = pricingCache ?? loadPricingSnapshot();
+		if (fallback && fallback.entries.length > 0) {
+			pricingCache = fallback;
+			return fallback;
+		}
+		return undefined;
 	})();
 
-	return pricingInFlight;
+	pricingInFlight = attempt;
+	try {
+		return await attempt;
+	} finally {
+		if (pricingInFlight === attempt) pricingInFlight = undefined;
+	}
 }
 
 /**
@@ -966,21 +1015,38 @@ async function showReport(title: string, body: string, ctx: ExtensionCommandCont
 // =============================================================================
 
 export default async function (pi: ExtensionAPI) {
-	// Warm the public pricing catalog so models/cost are available for `--list-models`,
-	// `--model kkai/...`, and the post-login model snapshot. Bounded so offline startup
-	// only waits briefly.
-	await loadPricing(undefined, false, PRICING_WARMUP_TIMEOUT_MS);
+	const registerProvider = () => {
+		pi.registerProvider(PROVIDER_ID, {
+			name: PROVIDER_NAME,
+			baseUrl: BASE_URL,
+			apiKey: API_KEY_CONFIG,
+			api: "openai-completions",
+			models: buildCatalogModels(),
+			async refreshModels(context) {
+				return discoverModels(context);
+			},
+		});
+	};
 
-	pi.registerProvider(PROVIDER_ID, {
-		name: PROVIDER_NAME,
-		baseUrl: BASE_URL,
-		apiKey: API_KEY_CONFIG,
-		api: "openai-completions",
-		models: buildCatalogModels(),
-		async refreshModels(context) {
-			return discoverModels(context);
-		},
-	});
+	// `pricingCache` is already seeded from the on-disk snapshot (see module init).
+	// With a snapshot we start instantly and refresh behind the scenes; on the very
+	// first run we wait briefly so models exist for `--list-models` / `--model kkai/...`.
+	const hadSnapshot = (pricingCache?.entries.length ?? 0) > 0;
+	if (!hadSnapshot) {
+		await loadPricing(undefined, false, PRICING_WARMUP_TIMEOUT_MS);
+	}
+
+	registerProvider();
+
+	if (hadSnapshot) {
+		// Republish once fresher pricing lands. Models already exist, so this only
+		// updates prices/entries and cannot race the model list into being empty.
+		void loadPricing(undefined, false)
+			.then((catalog) => {
+				if (catalog) registerProvider();
+			})
+			.catch(() => undefined);
+	}
 
 	// Refresh the discovered catalog after login/startup so /model matches the key.
 	pi.on("session_start", async (_event, ctx) => {
