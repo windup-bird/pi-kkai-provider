@@ -11,6 +11,14 @@
 		"kkrich"
 	],
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/windup-bird/pi-kkai-provider.git"
+	},
+	"homepage": "https://github.com/windup-bird/pi-kkai-provider#readme",
+	"bugs": {
+		"url": "https://github.com/windup-bird/pi-kkai-provider/issues"
+	},
 	"files": [
 		"index.ts",
 		"README.md"
