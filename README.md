@@ -13,9 +13,9 @@
 作为 pi 包安装：
 
 ```bash
-pi install /absolute/path/to/kkai-provider
-# 或临时加载
-pi -e /absolute/path/to/kkai-provider
+git clone https://github.com/windup-bird/pi-kkai-provider.git
+cd pi-kkai-provider
+pi install
 ```
 
 安装后重启（或 `/reload`）。
