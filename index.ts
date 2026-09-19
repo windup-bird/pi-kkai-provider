@@ -716,6 +716,100 @@ async function fetchServerUsage(apiKey: string, signal: AbortSignal | undefined,
 	};
 }
 
+// -----------------------------------------------------------------------------
+// Per-request logs (/api/log/token, readable with the API key alone)
+// -----------------------------------------------------------------------------
+
+/**
+ * The gateway keeps a per-request log at `GET {origin}/api/log/token?key=<key>`
+ * that needs no browser session. Every row carries the tokens the upstream
+ * actually reported -- including cache reads (`other.cache_tokens`) -- and the
+ * exact quota charged, which makes it the authoritative source for cost and
+ * cache hit rate (the response-level usage only covers turns pi stored).
+ */
+interface TokenLogRow {
+	createdAt: number;
+	model: string;
+	promptTokens: number;
+	completionTokens: number;
+	cacheTokens: number;
+	costUsd: number;
+	upstreamModel?: string;
+}
+
+function logsOrigin(): string {
+	return BASE_URL.replace(/\/v1\/?$/, "");
+}
+
+function parseTokenLogs(payload: unknown): TokenLogRow[] | undefined {
+	const root = asRecord(payload);
+	const rows = Array.isArray(root?.data) ? root.data : undefined;
+	if (!rows) return undefined;
+
+	const out: TokenLogRow[] = [];
+	for (const raw of rows) {
+		const row = asRecord(raw);
+		if (!row) continue;
+		let other: Record<string, unknown> = {};
+		if (typeof row.other === "string") {
+			try {
+				other = asRecord(JSON.parse(row.other)) ?? {};
+			} catch {
+				other = {};
+			}
+		} else {
+			other = asRecord(row.other) ?? {};
+		}
+		out.push({
+			createdAt: asNumber(row.created_at, 0),
+			model: typeof row.model_name === "string" ? row.model_name : "unknown",
+			promptTokens: asNumber(row.prompt_tokens, 0),
+			completionTokens: asNumber(row.completion_tokens, 0),
+			cacheTokens: asNumber(other.cache_tokens, 0),
+			costUsd: asNumber(row.quota, 0) / QUOTA_PER_UNIT,
+			...(typeof other.upstream_model_name === "string" ? { upstreamModel: other.upstream_model_name } : {}),
+		});
+	}
+	return out;
+}
+
+async function fetchTokenLogs(apiKey: string, signal: AbortSignal | undefined): Promise<TokenLogRow[] | undefined> {
+	const url = `${logsOrigin()}/api/log/token?key=${encodeURIComponent(apiKey)}`;
+	const headers = { Authorization: `Bearer ${apiKey}`, Accept: "application/json" };
+	// This endpoint is occasionally flaky (empty body / non-JSON); one retry smooths it over.
+	for (let attempt = 0; attempt < 2; attempt += 1) {
+		try {
+			const rows = parseTokenLogs(await fetchJson(url, { headers }, signal));
+			if (rows) return rows;
+		} catch {
+			// retry
+		}
+	}
+	return undefined;
+}
+
+function addLogRow(totals: Totals, row: TokenLogRow): void {
+	totals.requests += 1;
+	totals.input += Math.max(0, row.promptTokens - row.cacheTokens);
+	totals.cacheRead += row.cacheTokens;
+	totals.output += row.completionTokens;
+	totals.totalTokens += row.promptTokens + row.completionTokens;
+	totals.cost += row.costUsd;
+}
+
+/** Rebuild a local-shaped report from server-authoritative log rows. */
+function reportFromLogs(rows: readonly TokenLogRow[]): UsageReport {
+	const report = newReport();
+	for (const row of rows) {
+		addLogRow(bucket(report.models, row.model), row);
+		addLogRow(report.total, row);
+		if (row.createdAt > 0) {
+			addLogRow(bucket(report.days, new Date(row.createdAt * 1000).toISOString().slice(0, 10)), row);
+		}
+	}
+	return report;
+}
+
 // =============================================================================
 // Report formatting
 // =============================================================================
@@ -766,7 +860,13 @@ function sortByCost(entries: Iterable<[string, Totals]>): [string, Totals][] {
 	return [...entries].sort((a, b) => b[1].cost - a[1].cost || b[1].totalTokens - a[1].totalTokens);
 }
 
-function buildUsageText(report: UsageReport, scope: string, server: ServerUsage | undefined): string {
+function buildUsageText(
+	report: UsageReport,
+	scope: string,
+	server: ServerUsage | undefined,
+	serverLogs: readonly TokenLogRow[] | undefined,
+	compareLocally: boolean,
+): string {
 	const lines: string[] = [];
 	lines.push(`Scope: ${scope}`);
 	lines.push("");
@@ -799,9 +899,29 @@ function buildUsageText(report: UsageReport, scope: string, server: ServerUsage 
 		}
 	}
 
+	if (serverLogs && serverLogs.length > 0 && compareLocally) {
+		const truth = reportFromLogs(serverLogs);
+		const promptTokens = truth.total.input + truth.total.cacheRead;
+		const hitRate = promptTokens > 0 ? (truth.total.cacheRead / promptTokens) * 100 : 0;
+		lines.push("");
+		lines.push("Server truth (every request recorded for this API key)");
+		lines.push(
+			`  Requests:     ${formatInt(truth.total.requests)}      Actual spend: ${formatUsd(truth.total.cost)}`,
+		);
+		lines.push(
+			`  Prompt:       ${formatInt(promptTokens)} tokens, cache read ${formatInt(truth.total.cacheRead)} (${hitRate.toFixed(3)}% hit)`,
+		);
+		lines.push(
+			`  Completion:   ${formatInt(truth.total.output)} tokens` +
+				(truth.total.requests > report.total.requests
+					? `      (${formatInt(truth.total.requests - report.total.requests)} request(s) not in local sessions)`
+					: ""),
+		);
+	}
+
 	if (server) {
 		lines.push("");
-		lines.push(`Server quota (${server.period})`);
+		lines.push(`Account quota (${server.period})`);
 		if (server.error) {
 			lines.push(`  Unavailable: ${server.error}`);
 		} else {
@@ -874,18 +994,40 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("kkai-usage", {
-		description: "Show KKAI token usage and cost (current session; add --all for every session)",
+		description: "Show KKAI token usage and cost (current session; --all for every session, --server for gateway-log truth)",
 		getArgumentCompletions: (prefix) =>
 			[
 				{ value: "--all", label: "--all", description: "Aggregate every saved session" },
+				{ value: "--server", label: "--server", description: "Use the gateway's own request log (actual spend + cache hits)" },
 				{ value: "--session", label: "--session", description: "Current session only (default)" },
 			].filter((item) => item.value.startsWith(prefix)),
 		handler: async (args, ctx) => {
 			const all = /(^|\s)(--all|-a|all)(\s|$)/.test(args);
-			const report = newReport();
+			const serverMode = /(^|\s)(--server|-s|server)(\s|$)/.test(args);
 			const statusKey = `${PROVIDER_ID}-usage`;
 
-			if (all) {
+			let apiKey: string | undefined;
+			try {
+				apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+			} catch {
+				apiKey = undefined;
+			}
+
+			if (ctx.hasUI) ctx.ui.setStatus(statusKey, "Reading gateway usage log…");
+			const serverLogs = apiKey ? await fetchTokenLogs(apiKey, undefined) : undefined;
+			if (ctx.hasUI) ctx.ui.setStatus(statusKey, undefined);
+
+			let report = newReport();
+			let scope: string;
+
+			if (serverMode && serverLogs) {
+				report = reportFromLogs(serverLogs);
+				scope = `gateway log · ${report.total.requests} request(s) on this key`;
+			} else if (serverMode) {
+				scope = "gateway log unavailable, showing current session";
+				collectEntries(ctx.sessionManager.getBranch(), report, true);
+				report.sessions = 1;
+			} else if (all) {
 				if (ctx.hasUI) ctx.ui.setStatus(statusKey, "Scanning sessions…");
 				await collectAllSessions(report, (loaded, total) => {
 					if (ctx.hasUI && (loaded === total || loaded % 25 === 0)) {
@@ -893,23 +1035,21 @@ export default async function (pi: ExtensionAPI) {
 					}
 				});
 				if (ctx.hasUI) ctx.ui.setStatus(statusKey, undefined);
+				scope = `all sessions (${report.sessions} scanned)`;
 			} else {
 				collectEntries(ctx.sessionManager.getBranch(), report, true);
 				report.sessions = 1;
+				scope = "current session";
 			}
 
 			let server: ServerUsage | undefined;
 			try {
-				const apiKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
-				if (apiKey) server = await fetchServerUsage(apiKey, undefined, 30);
+				if (apiKey && !serverMode) server = await fetchServerUsage(apiKey, undefined, 30);
 			} catch {
 				// Quota lookup is best-effort.
 			}
 
-			const scope = all
-				? `all sessions (${report.sessions} scanned)`
-				: "current session";
-			const body = buildUsageText(report, scope, server);
+			const body = buildUsageText(report, scope, server, serverLogs, !serverMode);
 			await showReport(`KKAI usage · ${scope}`, body, ctx);
 			if (ctx.hasUI) ctx.ui.setStatus(statusKey, undefined);
 		},
