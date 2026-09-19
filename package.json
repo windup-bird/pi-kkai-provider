@@ -1,7 +1,7 @@
 {
 	"name": "pi-kkai-provider",
 	"version": "0.1.0",
-	"description": "KKAI (KKRICH) provider for pi: /login, dynamic model discovery, and token/cost usage stats for the KKRICH OpenAI-compatible API.",
+	"description": "KKAI (KKRICH) provider for pi: /login, dynamic model discovery, and real per-token cost so pi's own usage display is accurate.",
 	"type": "module",
 	"keywords": [
 		"pi-package",
@@ -33,13 +33,11 @@
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "*"
+		"@earendil-works/pi-coding-agent": "*"
 	},
 	"devDependencies": {
 		"@earendil-works/pi-ai": "^0.85.1",
 		"@earendil-works/pi-coding-agent": "^0.85.1",
-		"@earendil-works/pi-tui": "^0.85.1",
 		"typescript": "^5.6.0"
 	}
 }
